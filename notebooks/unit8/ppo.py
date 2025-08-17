@@ -4,7 +4,7 @@ import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="weather to capture videos of the agent performances (check out `videos` folder)")
+        help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="CartPole-v1",
@@ -98,79 +98,62 @@ def package_to_hub(repo_id,
                 eval_env,
                 video_fps=30,
                 commit_message="Push agent to the Hub",
-                token= None,
-                logs=None
-                ):
-  """
-  Evaluate, Generate a video and Upload a model to Hugging Face Hub.
-  This method does the complete pipeline:
-  - It evaluates the model
-  - It generates the model card
-  - It generates a replay video of the agent
-  - It pushes everything to the hub
-  :param repo_id: id of the model repository from the Hugging Face Hub
-  :param model: trained model
-  :param eval_env: environment used to evaluate the agent
-  :param fps: number of fps for rendering the video
-  :param commit_message: commit message
-  :param logs: directory on local machine of tensorboard logs you'd like to upload
-  """
-  msg.info(
+                token=None,
+                logs=None):
+    """
+    Evaluate, Generate a video and Upload a model to Hugging Face Hub.
+    """
+    msg.info(
         "This function will save, evaluate, generate a video of your agent, "
-        "create a model card and push everything to the hub. "
-        "It might take up to 1min. \n "
-        "This is a work in progress: if you encounter a bug, please open an issue."
+        "create a model card and push everything to the hub."
     )
-  # Step 1: Clone or create the repo
-  repo_url = HfApi().create_repo(
+    
+    # Step 1: Create repo
+    repo_url = HfApi().create_repo(
         repo_id=repo_id,
         token=token,
         private=False,
         exist_ok=True,
     )
-  
-  with tempfile.TemporaryDirectory() as tmpdirname:
-    tmpdirname = Path(tmpdirname)
+    
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        tmpdirname = Path(tmpdirname)
 
-    # Step 2: Save the model
-    torch.save(model.state_dict(), tmpdirname / "model.pt")
-  
-    # Step 3: Evaluate the model and build JSON
-    mean_reward, std_reward = _evaluate_agent(eval_env, 
-                                           10, 
-                                           model)
+        # Step 2: Save the model
+        torch.save(model.state_dict(), tmpdirname / "model.pt")
+        
+        # Step 3: Evaluate the model
+        mean_reward, std_reward = _evaluate_agent(eval_env, 10, model)
+        
+        # Prepare evaluation data
+        eval_datetime = datetime.datetime.now()
+        evaluate_data = {
+            "env_id": hyperparameters.env_id, 
+            "mean_reward": mean_reward,
+            "std_reward": std_reward,
+            "n_evaluation_episodes": 10,
+            "eval_datetime": eval_datetime.isoformat(),
+        }
+        
+        # Save evaluation results
+        with open(tmpdirname / "results.json", "w") as outfile:
+            json.dump(evaluate_data, outfile)
 
-    # First get datetime
-    eval_datetime = datetime.datetime.now()
-    eval_form_datetime = eval_datetime.isoformat()
+        # Step 4: Generate video
+        video_path = tmpdirname / "replay.mp4"
+        record_video(eval_env, model, video_path, video_fps)
+        
+        # Step 5: Generate model card
+        generated_model_card, metadata = _generate_model_card("PPO", hyperparameters.env_id, mean_reward, std_reward, hyperparameters)
+        _save_model_card(tmpdirname, generated_model_card, metadata)
 
-    evaluate_data = {
-        "env_id": hyperparameters.env_id, 
-        "mean_reward": mean_reward,
-        "std_reward": std_reward,
-        "n_evaluation_episodes": 10,
-        "eval_datetime": eval_form_datetime,
-    }
- 
-    # Write a JSON file
-    with open(tmpdirname / "results.json", "w") as outfile:
-      json.dump(evaluate_data, outfile)
-
-    # Step 4: Generate a video
-    video_path =  tmpdirname / "replay.mp4"
-    record_video(eval_env, model, video_path, video_fps)
-  
-    # Step 5: Generate the model card
-    generated_model_card, metadata = _generate_model_card("PPO", hyperparameters.env_id, mean_reward, std_reward, hyperparameters)
-    _save_model_card(tmpdirname, generated_model_card, metadata)
-
-    # Step 6: Add logs if needed
-    if logs:
-      _add_logdir(tmpdirname, Path(logs))
-  
-    msg.info(f"Pushing repo {repo_id} to the Hugging Face Hub")
-  
-    repo_url = upload_folder(
+        # Step 6: Add logs if provided
+        if logs:
+            _add_logdir(tmpdirname, Path(logs))
+        
+        # Step 7: Upload to Hub
+        msg.info(f"Pushing repo {repo_id} to the Hugging Face Hub")
+        repo_url = upload_folder(
             repo_id=repo_id,
             folder_path=tmpdirname,
             path_in_repo="",
@@ -178,176 +161,145 @@ def package_to_hub(repo_id,
             token=token,
         )
 
-    msg.info(f"Your model is pushed to the Hub. You can view your model here: {repo_url}")
-  return repo_url
+        msg.info(f"Your model is pushed to the Hub. You can view your model here: {repo_url}")
+    return repo_url
 
 def _evaluate_agent(env, n_eval_episodes, policy):
-  """
-  Evaluate the agent for ``n_eval_episodes`` episodes and returns average reward and std of reward.
-  :param env: The evaluation environment
-  :param n_eval_episodes: Number of episode to evaluate the agent
-  :param policy: The agent
-  """
-  episode_rewards = []
-  for episode in range(n_eval_episodes):
-    state = env.reset()
-    step = 0
-    done = False
-    total_rewards_ep = 0
+    """
+    Evaluate the agent for n_eval_episodes episodes.
+    """
+    episode_rewards = []
+    for _ in range(n_eval_episodes):
+        state, _ = env.reset()
+        done = False
+        total_rewards_ep = 0
+        
+        while not done:
+            state = torch.Tensor(state).to(device)
+            with torch.no_grad():
+                action, _, _, _ = policy.get_action_and_value(state)
+            state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
+            total_rewards_ep += reward
+            done = terminated or truncated
+        episode_rewards.append(total_rewards_ep)
     
-    while done is False:
-      state = torch.Tensor(state).to(device)
-      action, _, _, _ = policy.get_action_and_value(state)
-      new_state, reward, done, info = env.step(action.cpu().numpy())
-      total_rewards_ep += reward    
-      if done:
-        break
-      state = new_state
-    episode_rewards.append(total_rewards_ep)
-  mean_reward = np.mean(episode_rewards)
-  std_reward = np.std(episode_rewards)
-
-  return mean_reward, std_reward
-
+    mean_reward = np.mean(episode_rewards)
+    std_reward = np.std(episode_rewards)
+    return mean_reward, std_reward
 
 def record_video(env, policy, out_directory, fps=30):
-  images = []  
-  done = False
-  state = env.reset()
-  img = env.render(mode='rgb_array')
-  images.append(img)
-  while not done:
-    state = torch.Tensor(state).to(device)
-    # Take the action (index) that have the maximum expected future reward given that state
-    action, _, _, _  = policy.get_action_and_value(state)
-    state, reward, done, info = env.step(action.cpu().numpy()) # We directly put next_state = state for recording logic
-    img = env.render(mode='rgb_array')
+    """
+    Record a video of the agent's performance.
+    """
+    images = []  
+    state, _ = env.reset()
+    img = env.render()
     images.append(img)
-  imageio.mimsave(out_directory, [np.array(img) for i, img in enumerate(images)], fps=fps)
-
+    
+    done = False
+    while not done:
+        state = torch.Tensor(state).to(device)
+        with torch.no_grad():
+            action, _, _, _ = policy.get_action_and_value(state)
+        state, _, terminated, truncated, _ = env.step(action.cpu().numpy())
+        img = env.render()
+        images.append(img)
+        done = terminated or truncated
+    
+    imageio.mimsave(out_directory, [np.array(img) for img in images], fps=fps)
 
 def _generate_model_card(model_name, env_id, mean_reward, std_reward, hyperparameters):
-  """
-  Generate the model card for the Hub
-  :param model_name: name of the model
-  :env_id: name of the environment
-  :mean_reward: mean reward of the agent
-  :std_reward: standard deviation of the mean reward of the agent
-  :hyperparameters: training arguments
-  """
-  # Step 1: Select the tags
-  metadata = generate_metadata(model_name, env_id, mean_reward, std_reward)
-
-  # Transform the hyperparams namespace to string
-  converted_dict = vars(hyperparameters)
-  converted_str = str(converted_dict)
-  converted_str = converted_str.split(", ")
-  converted_str = '\n'.join(converted_str)
- 
-  # Step 2: Generate the model card
-  model_card = f"""
-  # PPO Agent Playing {env_id}
-
-  This is a trained model of a PPO agent playing {env_id}.
+    """
+    Generate the model card for the Hub.
+    """
+    metadata = generate_metadata(model_name, env_id, mean_reward, std_reward)
     
-  # Hyperparameters
-  ```python
-  {converted_str}
-  ```
-  """
-  return model_card, metadata
+    # Convert hyperparameters to string
+    converted_dict = vars(hyperparameters)
+    converted_str = '\n'.join([f"{k}: {v}" for k, v in converted_dict.items()])
+    
+    model_card = f"""
+    # PPO Agent Playing {env_id}
+
+    This is a trained model of a PPO agent playing {env_id}.
+        
+    # Hyperparameters
+    ```python
+    {converted_str}
+    ```
+    """
+    return model_card, metadata
 
 def generate_metadata(model_name, env_id, mean_reward, std_reward):
-  """
-  Define the tags for the model card
-  :param model_name: name of the model
-  :param env_id: name of the environment
-  :mean_reward: mean reward of the agent
-  :std_reward: standard deviation of the mean reward of the agent
-  """
-  metadata = {}
-  metadata["tags"] = [
-        env_id,
-        "ppo",
-        "deep-reinforcement-learning",
-        "reinforcement-learning",
-        "custom-implementation",
-        "deep-rl-course"
-  ]
-
-  # Add metrics
-  eval = metadata_eval_result(
-      model_pretty_name=model_name,
-      task_pretty_name="reinforcement-learning",
-      task_id="reinforcement-learning",
-      metrics_pretty_name="mean_reward",
-      metrics_id="mean_reward",
-      metrics_value=f"{mean_reward:.2f} +/- {std_reward:.2f}",
-      dataset_pretty_name=env_id,
-      dataset_id=env_id,
-  )
-
-  # Merges both dictionaries
-  metadata = {**metadata, **eval}
-
-  return metadata
+    """
+    Define the tags for the model card.
+    """
+    metadata = {
+        "tags": [
+            env_id,
+            "ppo",
+            "deep-reinforcement-learning",
+            "reinforcement-learning",
+            "custom-implementation",
+            "deep-rl-course"
+        ]
+    }
+    
+    eval_metadata = metadata_eval_result(
+        model_pretty_name=model_name,
+        task_pretty_name="reinforcement-learning",
+        task_id="reinforcement-learning",
+        metrics_pretty_name="mean_reward",
+        metrics_id="mean_reward",
+        metrics_value=f"{mean_reward:.2f} +/- {std_reward:.2f}",
+        dataset_pretty_name=env_id,
+        dataset_id=env_id,
+    )
+    
+    metadata.update(eval_metadata)
+    return metadata
 
 def _save_model_card(local_path, generated_model_card, metadata):
-    """Saves a model card for the repository.
-    :param local_path: repository directory
-    :param generated_model_card: model card generated by _generate_model_card()
-    :param metadata: metadata
+    """
+    Save the model card and metadata.
     """
     readme_path = local_path / "README.md"
-    readme = ""
-    if readme_path.exists():
-        with readme_path.open("r", encoding="utf8") as f:
-            readme = f.read()
-    else:
-        readme = generated_model_card
-
     with readme_path.open("w", encoding="utf-8") as f:
-        f.write(readme)
-
-    # Save our metrics to Readme metadata
+        f.write(generated_model_card)
     metadata_save(readme_path, metadata)
 
-def _add_logdir(local_path: Path, logdir: Path):
-  """Adds a logdir to the repository.
-  :param local_path: repository directory
-  :param logdir: logdir directory
-  """
-  if logdir.exists() and logdir.is_dir():
-    # Add the logdir to the repository under new dir called logs
-    repo_logdir = local_path / "logs"
-    
-    # Delete current logs if they exist
-    if repo_logdir.exists():
-      shutil.rmtree(repo_logdir)
-
-    # Copy logdir into repo logdir
-    shutil.copytree(logdir, repo_logdir)
+def _add_logdir(local_path, logdir):
+    """
+    Add log directory to the repository.
+    """
+    if logdir.exists() and logdir.is_dir():
+        repo_logdir = local_path / "logs"
+        if repo_logdir.exists():
+            shutil.rmtree(repo_logdir)
+        shutil.copytree(logdir, repo_logdir)
 
 def make_env(env_id, seed, idx, capture_video, run_name):
+    """
+    Create a wrapped environment.
+    """
     def thunk():
-        env = gym.make(env_id)
+        env = gym.make(env_id, render_mode="rgb_array")
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if capture_video:
-            if idx == 0:
-                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.seed(seed)
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
-
     return thunk
 
-
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """
+    Initialize layer weights.
+    """
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
-
 
 class Agent(nn.Module):
     def __init__(self, envs):
@@ -377,13 +329,12 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
-
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -393,13 +344,14 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+    
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
+    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -407,7 +359,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
+    # Environment setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
@@ -416,7 +368,7 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # ALGO Logic: Storage setup
+    # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -424,15 +376,15 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-    # TRY NOT TO MODIFY: start the game
+    # Training loop
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset()).to(device)
+    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(1, num_updates + 1):
-        # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * args.learning_rate
@@ -443,26 +395,25 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
 
-            # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, done, info = envs.step(action.cpu().numpy())
+            next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
+            next_done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            for item in info:
-                if "episode" in item.keys():
-                    print(f"global_step={global_step}, episodic_return={item['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
-                    break
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-        # bootstrap value if not done
+        # Compute advantages and returns
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             if args.gae:
@@ -490,7 +441,7 @@ if __name__ == "__main__":
                     returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
                 advantages = returns - values
 
-        # flatten the batch
+        # Flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -498,7 +449,7 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # Optimizing the policy and value network
+        # Optimize policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -512,7 +463,6 @@ if __name__ == "__main__":
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -549,15 +499,14 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
-            if args.target_kl is not None:
-                if approx_kl > args.target_kl:
-                    break
+            if args.target_kl is not None and approx_kl > args.target_kl:
+                break
 
+        # Log training metrics
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
@@ -572,13 +521,12 @@ if __name__ == "__main__":
     envs.close()
     writer.close()
 
-    # Create the evaluation environment
-    eval_env = gym.make(args.env_id)
-
-    package_to_hub(repo_id = args.repo_id,
-                model = agent, # The model we want to save
-                hyperparameters = args,
-                eval_env = gym.make(args.env_id),
-                logs= f"runs/{run_name}",
-                )
-    
+    # Push to Hub
+    eval_env = gym.make(args.env_id, render_mode="rgb_array")
+    package_to_hub(
+        repo_id=args.repo_id,
+        model=agent,
+        hyperparameters=args,
+        eval_env=eval_env,
+        logs=f"runs/{run_name}",
+    )
